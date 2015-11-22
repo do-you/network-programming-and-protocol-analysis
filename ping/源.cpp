@@ -7,14 +7,12 @@
 #include "ip_icmp.h"
 using namespace std::chrono;
 
-int nsent = 1;
+#define time_out -2
+#define error -1
+
 int datalen = 32;
 int pid = 0;
-
-uint16_t in_cksum(uint16_t * addr, int len);
-//int recv_v4(SOCKET sockfd);
-//void send_v4(SOCKET sockfd, sockaddr* sasend, int salen);
-//void proc_v4(char *ptr, int len, steady_clock::time_point start);
+int timeout = 2000;
 
 uint16_t in_cksum(uint16_t *addr, int len)
 {
@@ -43,57 +41,53 @@ uint16_t in_cksum(uint16_t *addr, int len)
 	return(answer);
 }
 
-int recv_v4(SOCKET sockfd, char *recvbuf)
+int recv_v4(SOCKET sockfd, int nsend, sockaddr_in *addr,int &ttl)
 {
-	int				size;
 	int             n;
-	sockaddr_in     addr;
+	char  recvbuf[1500];
 	int len = sizeof(sockaddr);
+	clock_t t1, t2;
 
-	n = recvfrom(sockfd, recvbuf, 1500, 0, (sockaddr*)&addr, &len);
-	if (n < 0)
+	t1 = clock();
+	while (true)
 	{
-		if (WSAGetLastError() == WSAETIMEDOUT)
-			printf("receive time out\n");
-		else
-			printf("recv fail with error code %d\n", WSAGetLastError());
-		return -1;
-	}
-	return n;
-}
+		n = recvfrom(sockfd, recvbuf, 1500, 0, (sockaddr*)addr, &len);
+		if (n < 0)
+		{
+			if (WSAGetLastError() == WSAETIMEDOUT)
+				return time_out;
+			else
+			{
+				printf("recv fail with error code %d\n", WSAGetLastError());
+				return error;
+			}
+		}
+		t2 = clock();
+		if (1000.0*(t2 - t1) / CLOCKS_PER_SEC >= timeout)
+			return time_out;
+		//process icmp
+		int				hlen1, icmplen, hlen2;
+		struct ip		*ip;
+		struct icmp		*icmp;
 
-void proc_v4(char *recvbuf, int len, int nsent, steady_clock::time_point start)
-{
-	int				hlen1, icmplen;
-	struct ip		*ip;
-	struct icmp		*icmp;
-	auto            end = steady_clock::now();
-	double          rtt;
+		ip = (struct ip *) recvbuf;		/* start of IP header */
+		hlen1 = ip->ip_hl << 2;		/* length of IP header */
+		if (ip->ip_p != IPPROTO_ICMP)
+			continue;			/* not ICMP */
 
-	ip = (struct ip *) recvbuf;		/* start of IP header */
-	hlen1 = ip->ip_hl << 2;		/* length of IP header */
-	if (ip->ip_p != IPPROTO_ICMP)
-		return;				/* not ICMP */
+		icmp = (struct icmp *) (recvbuf + hlen1);	/* start of ICMP header */
+		if ((icmplen = n - hlen1) < 8)
+			continue;				/* malformed packet */
 
-	icmp = (struct icmp *) (recvbuf + hlen1);	/* start of ICMP header */
-	if ((icmplen = len - hlen1) < 8)
-		return;				/* malformed packet */
-
-	if (icmp->icmp_type == ICMP_ECHOREPLY&&icmp->icmp_seq == nsent)
-	{
-		if (icmp->icmp_id != pid)
-			return;			/* not a response to our ECHO_REQUEST */
-		if (icmplen < 16)
-			return;			/* not enough data to use */
-
-		rtt = duration_cast<duration<double, std::milli>>(end - start).count();
-
-		char strbuf[50];
-		printf("%d bytes from %s: seq=%u, ttl=%d, rtt=%.3lf ms\n",
-			datalen, inet_ntop(AF_INET, &ip->ip_src, strbuf, 50),
-			icmp->icmp_seq, ip->ip_ttl, rtt);
+		if (icmp->icmp_type == ICMP_ECHOREPLY && icmp->icmp_seq == nsend && icmp->icmp_id == pid)
+		{
+			ttl = ip->ip_ttl;
+			return ICMP_ECHOREPLY;
+		}
 	}
 }
+
+
 void send_v4(SOCKET sockfd, int nsent, sockaddr* sasend, int salen)
 {
 	int			len;
@@ -104,7 +98,7 @@ void send_v4(SOCKET sockfd, int nsent, sockaddr* sasend, int salen)
 	icmp->icmp_type = ICMP_ECHO;
 	icmp->icmp_code = 0;
 	icmp->icmp_id = pid;
-	icmp->icmp_seq = nsent++;
+	icmp->icmp_seq = nsent;
 	memset(icmp->icmp_data, 0xa5, datalen);	/* fill with pattern */
 
 	len = 8 + datalen;		/* checksum ICMP header and data */
@@ -119,35 +113,47 @@ void send_v4(SOCKET sockfd, int nsent, sockaddr* sasend, int salen)
 	}
 }
 
-void ping(sockaddr* sasend, int salen)
+void ping(sockaddr* sasend,int salen)
 {
-	sockaddr_in bind_addr;
-	memset(&bind_addr, 0, sizeof(bind_addr));
-	bind_addr.sin_family = AF_INET;
-	bind_addr.sin_addr.s_addr = INADDR_ANY;
-
 	SOCKET sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	bind(sockfd, (sockaddr*)&bind_addr, sizeof(bind_addr));
-
-	int timeout = 2000;
+	if (sockfd == INVALID_SOCKET )
+	{
+		printf("socket failed with error = %d\n", WSAGetLastError());
+		return;
+	}
 	setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, 4);
 
-	char recvbuf[1500];
-	int n;
-	for (int i = 1; i <= 500; i++)
+	int n, recvflag,ttl;
+	char buf[50];
+	sockaddr_in remoteaddr;
+	for (int i = 1; i <= 4; i++)
 	{
 		auto start = steady_clock::now();
 
-		send_v4(sockfd, i,sasend, salen);
-		if ((n = recv_v4(sockfd, recvbuf)) != -1)
-			proc_v4(recvbuf, n,i, start);
-// 		Sleep(1000);
+		send_v4(sockfd, i, sasend, salen);
+		recvflag = recv_v4(sockfd, i, &remoteaddr,ttl);
+
+		auto end = steady_clock::now();
+		switch (recvflag)
+		{
+		case time_out:
+			printf("Request timed out.\n");
+			continue;
+		case error:
+			return;
+		default:
+			break;
+		}
+		printf("%d bytes from %s: seq=%u, ttl=%d, rtt=%.2lf ms\n",datalen, inet_ntop(AF_INET, &remoteaddr.sin_addr, buf, 50),i, ttl, 
+			duration_cast<duration<double, std::milli>>(end - start).count());
+ 		Sleep(1000);
 	}
 }
 int main(int argc, char **argv)
 {
 	WSADATA wsaData;
-	int error = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	WSAStartup(MAKEWORD(2, 2), &wsaData);
+	pid = GetCurrentProcessId();
 
 	if (argc == 2)
 	{
